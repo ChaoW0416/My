@@ -1,0 +1,222 @@
+import numpy as np
+import random
+import networkx as nx
+
+fixed_cost = 200000          # 所有站点统一固定成本
+variable_cost = 50000       # 所有站点统一每桩成本
+adjustment_coefficient = 1/10000000
+max_wait_time = 20         # 单位：分钟
+service_rate = 1/30           #
+battery_range = 9         # 电动车续航
+budget = 7000000             # 总预算
+
+
+NUM_NODES = int(input("请输入节点总数 NUM_NODES： "))
+G = nx.Graph()
+G.add_nodes_from(range(NUM_NODES))  # 加入节点0~N-1
+
+print(f"\n请输入所有边及其距离（格式：节点i 节点j 距离），多个边用英文逗号分隔")
+print("例如：0 1 12.5, 0 2 18, 1 3 9.2")
+
+edge_input = input("输入所有边：\n")
+
+edges = [e.strip() for e in edge_input.strip().split(",")]
+
+for e in edges:
+    try:
+        parts = e.split()
+        if len(parts) != 3:
+            raise ValueError("每条边格式应为 i j 距离")
+        i, j = int(parts[0]), int(parts[1])
+        d = float(parts[2])
+        if not (0 <= i <= NUM_NODES and 0 <= j <= NUM_NODES):
+            raise ValueError(f"节点编号应在 0 ~ {NUM_NODES} 之间")
+        if i == j:
+            raise ValueError("不能输入自环边")
+        G.add_edge(i, j, weight=d)
+        print(f"✅ 添加边：{i} -- {j}，距离 = {d}")
+    except Exception as ex:
+        print(f"❌ 边 `{e}` 输入有误：{ex}")
+
+    # 用户自定义参数
+    # 手动输入每个节点的权重
+print(f"请输入 {NUM_NODES} 个节点的权重（空格分隔）:")
+user_input = input()
+node_weights = np.array(list(map(float, user_input.strip().split())))
+
+# 检查数量是否正确
+assert len(node_weights) == NUM_NODES, "节点权重数量与节点数不匹配！"
+
+POP_SIZE = 30
+DNA_SIZE = NUM_NODES
+N_GENERATIONS = 100
+CROSS_RATE = 0.9
+MUTATION_RATE = 0.1
+
+def calculate_arrival_rates_and_capacities(G):
+    arrival_rates = []
+    capacities = []
+
+    # 构造 OD 流量列表（路径+流量）
+    OD_paths = []
+    OD_flows = []
+
+    for i in range(NUM_NODES):
+        for j in range(NUM_NODES):
+            if i == j:
+                continue
+            try:
+                d = nx.shortest_path_length(G, i, j, weight='weight')
+                flow = (node_weights[i] * node_weights[j]) ** 1.5/ (d ** 0.5)
+                path = nx.shortest_path(G, i, j, weight='weight')
+                OD_paths.append(path)
+                OD_flows.append(flow)
+            except:
+                continue
+
+    # 对每个节点，统计其到达率
+    for i in range(NUM_NODES):
+        λ_i = sum(flow for path, flow in zip(OD_paths, OD_flows) if i in path)* adjustment_coefficient
+        arrival_rates.append(λ_i)
+
+        import math
+        c_i = math.ceil((λ_i * max_wait_time / 60) / service_rate)
+
+        capacities.append(c_i)
+
+    # 打印
+    print("\n📊 定容阶段结果（每个节点的到达率和最小桩数）")
+    print("节点编号\t到达率λ\t所需桩数")
+    print("--------------------------------")
+    for i in range(NUM_NODES):
+        print(f"{i+1:<8}\t{arrival_rates[i]:.2f}\t{capacities[i]}")
+
+    return arrival_rates, capacities
+
+
+# ---------------------- 生成初始种群 ----------------------
+def generate_population():
+    return np.random.randint(0, 2, size=(POP_SIZE, DNA_SIZE))
+
+# ---------------------- 预算约束修正 ----------------------
+def compute_cost(ind, capacities):
+    total_cost = 0
+    for i, x in enumerate(ind):
+        if x == 1:
+            total_cost += fixed_cost + capacities[i] * variable_cost
+    return total_cost
+#-------------随机将不符合预算约束的方案中随机基因位点改成0-------------
+def repair_individual(ind,capacities):
+    while compute_cost(ind,capacities) > budget:
+        ones = np.where(ind == 1)[0]
+        if len(ones) == 0:
+            break
+        i = random.choice(ones)
+        ind[i] = 0
+    return ind
+#-------------路径可行性约束（与到达每点的剩余电量有关）-------------
+def is_path_feasible(start, end, ind, G):
+    try:
+        path = nx.dijkstra_path(G, start, end, weight='weight')
+        battery = battery_range if ind[start] else battery_range / 2
+        for k in range(len(path) - 1):
+            d = G[path[k]][path[k + 1]]['weight']
+            battery -= d
+            if battery < 0:
+                return False
+            if ind[path[k + 1]]:
+                battery = battery_range
+        return battery >= battery_range / 2 if not ind[end] else True
+    except:
+        return False
+#-------------只有当路径可行时所截取的流量才计入总流量-------------
+def evaluate_fitness(ind, G):
+    total_flow = 0
+    for i in range(NUM_NODES):
+        for j in range(NUM_NODES):
+            if i == j:
+                continue
+            try:
+                d = nx.shortest_path_length(G, i, j, weight='weight')
+                flow = (node_weights[i] * node_weights[j])  / (d ** 1.5)
+                if is_path_feasible(i, j, ind, G):
+                    total_flow += flow
+            except:
+                continue
+    return total_flow
+
+def calculate_total_allflow(G):
+    total_allflow = 0
+    for i in range(NUM_NODES):
+        for j in range(NUM_NODES):
+            if i != j:
+                try:
+                    d = nx.shortest_path_length(G, i, j, weight='weight')
+                    flow = (node_weights[i] * node_weights[j]) / (d ** 1.5)
+                    total_allflow += flow
+                except:
+                    continue
+    return total_allflow
+
+def crossover(parent, pop):
+    child = parent.copy()
+    if np.random.rand() < CROSS_RATE:
+        i_ = np.random.randint(0, POP_SIZE)
+        cross_points = np.random.randint(0, 2, DNA_SIZE).astype(bool)
+        child[cross_points] = pop[i_][cross_points]
+    return child
+
+def mutate(child):
+    for i in range(DNA_SIZE):
+        if np.random.rand() < MUTATION_RATE:
+            child[i] = 1 - child[i]
+    return child
+
+def tournament_selection(fitnesses):
+    idx1, idx2 = random.sample(range(len(fitnesses)), 2)
+    return idx1 if fitnesses[idx1] > fitnesses[idx2] else idx2
+
+def run_genetic_algorithm(G, capacities):
+    population = np.random.randint(0, 2, size=(POP_SIZE, NUM_NODES))
+    population = np.array([repair_individual(ind, capacities) for ind in population])
+    fitnesses = np.array([evaluate_fitness(ind, G) for ind in population])
+    best_solution = population[np.argmax(fitnesses)]
+    best_fitness = max(fitnesses)
+
+    for generation in range(N_GENERATIONS):
+        new_population = []
+        for _ in range(POP_SIZE):
+            idx = tournament_selection(fitnesses)
+            parent = population[idx]
+            child = crossover(parent, population)
+            child = mutate(child)
+            child = repair_individual(child, capacities)
+            new_population.append(child)
+
+        population = np.array(new_population)
+        fitnesses = np.array([evaluate_fitness(ind, G) for ind in population])
+        current_best = population[np.argmax(fitnesses)]
+
+        if max(fitnesses) > best_fitness:
+            best_solution = current_best
+            best_fitness = max(fitnesses)
+        population[0] = best_solution
+        fitnesses[0] = best_fitness
+
+
+        # 计算总流量与截取占比
+    total_allflow = calculate_total_allflow(G)
+    percentage = 100 * best_fitness / total_allflow if total_allflow > 0 else 0
+
+
+    print("\n✅ 最优选址方案：", np.where(best_solution == 1)[0])
+    print(f"截取流量总和：{best_fitness:.2f}")
+    print(f"建设成本：{compute_cost(best_solution, capacities)}")
+    print(f"截取占总流量比例：{percentage:.2f}%")
+
+def main():
+    arrival_rates, capacities = calculate_arrival_rates_and_capacities(G)
+    run_genetic_algorithm(G, capacities)
+
+if __name__ == "__main__":
+    main()
